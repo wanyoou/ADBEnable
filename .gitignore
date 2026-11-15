@@ -1,0 +1,11 @@
+# Build artifacts
+dist/
+
+# Local conversation export: contains device-specific data (serial, paths)
+ADB 失效原因分析与排查.md
+
+# Python / editor / OS noise
+__pycache__/
+*.pyc
+.DS_Store
+*.log

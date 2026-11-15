@@ -1,0 +1,185 @@
+#!/system/bin/sh
+# ============================================================================
+# ADB Enable - command line helper
+#
+#   su -c '/data/adb/modules/adb_enable/bin/adb-enable status'
+#   su -c '/data/adb/modules/adb_enable/bin/adb-enable run'
+#   su -c '/data/adb/modules/adb_enable/bin/adb-enable addkey /sdcard/adbkey.pub'
+#   su -c '/data/adb/modules/adb_enable/bin/adb-enable wireless on'
+# ============================================================================
+
+case "$0" in
+*/bin/*) MODDIR=${0%/bin/*} ;;
+*) MODDIR=${ADBEN_MODDIR:-/data/adb/modules/adb_enable} ;;
+esac
+
+. "$MODDIR/common.sh"
+
+STAGE=cli
+setup_runtime
+ensure_default_config
+load_config
+
+usage() {
+	cat <<EOF
+ADB Enable $(module_version) - $(MODDIR)
+
+usage: ${0##*/} <command>
+
+  status              show settings, properties, adbd, keys
+  run                 apply everything right now (same as Magisk Action)
+  keys                list the trust store and the key sources
+  addkey FILE         copy FILE into $KEYS_DIR and install it
+  wireless on|off     toggle adb over TCP (port $WIRELESS_PORT)
+  config              print $CONFIG_FILE
+  log                 tail -n 80 $LOG_FILE
+EOF
+}
+
+cmd_status() {
+	n=$(count_keys "$ADB_KEYS_FILE")
+	[ -n "$n" ] || n=0
+	printf 'ADB Enable %s\n' "$(module_version)"
+	printf '  module dir      : %s\n' "$MODDIR"
+	printf '  config          : %s\n' "$CONFIG_FILE"
+	printf '  log             : %s\n' "$LOG_FILE"
+	printf '  boot completed  : %s\n' "$(prop_get sys.boot_completed)"
+	printf '  adb_enabled     : %s\n' "$(settings_value global adb_enabled)"
+	printf '  dev options     : %s\n' "$(settings_value global development_settings_enabled)"
+	printf '  provisioned     : %s\n' "$(settings_value global device_provisioned)"
+	printf '  setup complete  : %s\n' "$(settings_value secure user_setup_complete)"
+	printf '  adbd            : %s\n' "$(prop_get init.svc.adbd)"
+	printf '  usb config      : %s\n' "$(prop_get sys.usb.config)"
+	printf '  usb state       : %s\n' "$(prop_get sys.usb.state)"
+	printf '  usb ffs ready   : %s\n' "$(prop_get sys.usb.ffs.ready)"
+	printf '  ro.adb.secure   : %s\n' "$(prop_get ro.adb.secure)"
+	printf '  miui adbinput   : %s\n' "$(prop_get persist.security.adbinput)"
+	printf '  miui adbinstall : %s\n' "$(prop_get persist.security.adbinstall)"
+	printf '  adb keys        : %s (%s key(s))\n' "$ADB_KEYS_FILE" "$n"
+	printf '  wireless port   : service=%s persist=%s\n' \
+		"$(prop_get service.adb.tcp.port)" "$(prop_get persist.adb.tcp.port)"
+}
+
+cmd_run() {
+	log "===== ADB Enable $(module_version) cli run ====="
+	apply_all
+	printf 'applied, log: %s\n' "$LOG_FILE"
+}
+
+cmd_keys() {
+	n=$(count_keys "$ADB_KEYS_FILE")
+	[ -n "$n" ] || n=0
+	printf 'trust store: %s (%s key(s))\n' "$ADB_KEYS_FILE" "$n"
+	ls -l "$ADB_KEYS_FILE" 2>/dev/null
+	printf 'key sources:\n'
+	found=0
+	for f in "$KEYS_DIR"/*; do
+		[ -f "$f" ] || continue
+		printf '  %s\n' "$f"
+		found=1
+	done
+	for f in "$MODDIR"/keys/* /data/local/tmp/adbkey.pub /data/local/tmp/adb_keys; do
+		[ -f "$f" ] || continue
+		printf '  %s\n' "$f"
+		found=1
+	done
+	if [ "$KEYS_FROM_STORAGE" = 1 ]; then
+		for f in /sdcard/adbkey.pub /sdcard/adb_keys /sdcard/adb-enable/adb_keys \
+			/sdcard/adb-enable/keys/*; do
+			[ -f "$f" ] || continue
+			printf '  %s\n' "$f"
+			found=1
+		done
+	else
+		printf '  (/sdcard ignored: KEYS_FROM_STORAGE=0)\n'
+	fi
+	[ "$found" = 1 ] || printf '  (none)\n'
+}
+
+cmd_addkey() {
+	src=$1
+	if [ -z "$src" ] || [ ! -f "$src" ]; then
+		echo "usage: ${0##*/} addkey <file>" >&2
+		return 1
+	fi
+	if ! filter_keys <"$src" 2>/dev/null | grep -q .; then
+		echo "no valid adb public key in $src" >&2
+		return 1
+	fi
+	name=${src##*/}
+	# Hidden / README-like names are ignored by the scanner; rename them so the
+	# command cannot report success while importing nothing.
+	case "$name" in
+	.* | README* | readme*) name="key.${name#.}" ;;
+	esac
+	cp -f "$src" "$KEYS_DIR/$name" 2>/dev/null || {
+		echo "cannot write $KEYS_DIR/$name" >&2
+		return 1
+	}
+	chmod 0600 "$KEYS_DIR/$name" 2>/dev/null
+	log "cli: imported key file $src -> $KEYS_DIR/$name"
+	if ! sync_keys late; then
+		echo "failed to install key, see $LOG_FILE" >&2
+		return 1
+	fi
+	echo "imported $KEYS_DIR/$name"
+}
+
+set_config_value() {
+	key=$1
+	value=$2
+	if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+		sed -i "s|^${key}=.*|${key}=${value}|" "$CONFIG_FILE"
+	else
+		printf '%s=%s\n' "$key" "$value" >>"$CONFIG_FILE"
+	fi
+}
+
+cmd_wireless() {
+	case "$1" in
+	on | 1)
+		if [ "$ENABLE_ADB" != 1 ]; then
+			echo "ENABLE_ADB=0 in $CONFIG_FILE; enable it first" >&2
+			return 1
+		fi
+		set_config_value WIRELESS_ADB 1
+		load_config
+		echo "wireless ADB on, port $WIRELESS_PORT (adb connect <phone-ip>:$WIRELESS_PORT)"
+		echo "restarting adbd: the current adb session may drop"
+		apply_wireless
+		;;
+	off | 0)
+		set_config_value WIRELESS_ADB 0
+		load_config
+		echo "wireless ADB off (adbd is restarted only if a TCP port was active)"
+		apply_wireless
+		;;
+	*)
+		echo "usage: ${0##*/} wireless on|off" >&2
+		return 1
+		;;
+	esac
+}
+
+cmd_log() {
+	if [ -f "$LOG_FILE" ]; then
+		tail -n 80 "$LOG_FILE"
+	else
+		printf 'no log yet: %s\n' "$LOG_FILE"
+	fi
+}
+
+case "${1:-status}" in
+status) cmd_status ;;
+run) cmd_run ;;
+keys) cmd_keys ;;
+addkey) cmd_addkey "$2" ;;
+wireless) cmd_wireless "$2" ;;
+config) cat "$CONFIG_FILE" ;;
+log) cmd_log ;;
+help | -h | --help) usage ;;
+*)
+	usage
+	exit 1
+	;;
+esac
