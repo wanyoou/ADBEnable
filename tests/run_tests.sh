@@ -230,7 +230,8 @@ new_env() {
 	FAKE="$TMP/root"
 	mkdir -p "$FAKE/bin" "$FAKE/module" "$FAKE/data/adb/adb-enable/keys" \
 		"$FAKE/data/misc/adb"
-	cp -a "$ROOT/module/." "$FAKE/module/"
+	# Use the host cp for setup; the fake cp below is only for module code.
+	PATH=$ORIG_PATH cp -a "$ROOT/module/." "$FAKE/module/"
 	make_stubs
 	: >"$FAKE/props"
 	: >"$FAKE/settings.db"
@@ -448,9 +449,53 @@ EOF
 	assert_eq "zero-config adb_enabled" 1 "$(setting global adb_enabled)"
 	assert_eq "zero-config adbd" running "$(prop init.svc.adbd)"
 	case "$(prop sys.usb.state)" in *adb*) ok ;; *) bad "zero-config usb: $(prop sys.usb.state)" ;; esac
-	assert_contains "auth refresh logged" "restarting once to apply ro.adb.secure=0" "$(logtext)"
+	assert_contains "fresh start needs no restart" "started after ro.adb.secure=0, no restart needed" "$(logtext)"
+	assert_eq "no adbd restart after fresh start" 0 "$(grep -c 'ctl.restart' "$FAKE/setprop.log" 2>/dev/null || true)"
 	assert_no_file "still no adb_keys" "$ADBEN_ADB_KEYS"
 	assert_no_file "no fd violations" "$FAKE/fd_violations"
+}
+
+test_adbd_preexisting_refresh() {
+	start_test "service: restart adbd only when it predates the prop"
+	new_env
+	write_config <<'EOF'
+BOOT_DELAY=0
+RECHECK_SECONDS=0
+SETTINGS_RETRY_DELAY=0
+EOF
+	# Simulate a ROM that started adbd before post-fs-data could set the
+	# property; this is the only case where a one-time restart is needed.
+	printf 'sys.boot_completed=0\ninit.svc.adbd=running\nsys.usb.config=mtp,adb\nsys.usb.state=mtp,adb\nsys.usb.ffs.ready=1\nro.adb.secure=1\n' >"$FAKE/props"
+	assert_eq "pfd rc" 0 "$(run_pfd)"
+	assert_eq "prop applied" 0 "$(prop ro.adb.secure)"
+	assert_file "refresh flag written" "$ADBEN_STATE_DIR/.adbd_preexisting"
+	set_prop sys.boot_completed 1
+	assert_eq "service rc" 0 "$(run_service)"
+	assert_contains "restart logged" "restarting once (it was running before ro.adb.secure=0)" "$(logtext)"
+	assert_eq "one adbd restart" 1 "$(grep -c 'ctl.restart=adbd' "$FAKE/setprop.log" 2>/dev/null || true)"
+	assert_no_file "flag cleared after refresh" "$ADBEN_STATE_DIR/.adbd_preexisting"
+	assert_eq "second service rc" 0 "$(run_service)"
+	assert_eq "no second restart" 1 "$(grep -c 'ctl.restart=adbd' "$FAKE/setprop.log" 2>/dev/null || true)"
+	assert_no_file "no fd violations" "$FAKE/fd_violations"
+}
+
+test_adbd_already_insecure() {
+	start_test "service: already insecure adbd is not restarted"
+	new_env
+	write_config <<'EOF'
+BOOT_DELAY=0
+RECHECK_SECONDS=0
+SETTINGS_RETRY_DELAY=0
+EOF
+	# A userdebug ROM may already have ro.adb.secure=0.  A pre-existing adbd
+	# then read the right value and must not be restarted either.
+	printf 'sys.boot_completed=0\ninit.svc.adbd=running\nsys.usb.config=mtp,adb\nsys.usb.state=mtp,adb\nsys.usb.ffs.ready=1\nro.adb.secure=0\n' >"$FAKE/props"
+	assert_eq "pfd rc" 0 "$(run_pfd)"
+	assert_eq "flag is zero" 0 "$(cat "$ADBEN_STATE_DIR/.adbd_preexisting")"
+	set_prop sys.boot_completed 1
+	assert_eq "service rc" 0 "$(run_service)"
+	assert_contains "already insecure logged" "already running with ro.adb.secure=0, no refresh needed" "$(logtext)"
+	assert_eq "no adbd restart" 0 "$(grep -c 'ctl.restart' "$FAKE/setprop.log" 2>/dev/null || true)"
 }
 
 test_ffs_not_ready() {
@@ -814,7 +859,7 @@ EOF
 	else
 		ok
 	fi
-	assert_contains "installer banner" "- ADB Enable v1.0.0" "$out"
+	assert_contains "installer banner" "- ADB Enable v1.0.1" "$out"
 	assert_contains "installer key note" "No-key mode" "$out"
 	assert_contains "exec bit set" "set_perm_recursive" "$(cat "$FAKE/perm.log")"
 }
@@ -832,7 +877,7 @@ EOF
 	printf 'global/adb_enabled=1\n' >"$FAKE/settings.db"
 
 	out=$("$SH" "$FAKE/module/bin/adb-enable" status 2>&1)
-	assert_contains "status version" "ADB Enable v1.0.0" "$out"
+	assert_contains "status version" "ADB Enable v1.0.1" "$out"
 	assert_contains "status adb_enabled" "adb_enabled     : 1" "$out"
 	assert_contains "status adbd" "adbd            : running" "$out"
 
@@ -892,7 +937,7 @@ for required in ("post-fs-data.sh", "service.sh", "action.sh", "uninstall.sh",
     if mode != 0o755:
         problems.append("%s mode %o" % (required, mode))
 props = z.read("module.prop").decode()
-for line in ("id=adb_enable", "name=ADB Enable", "version=v1.0.0", "versionCode=10000"):
+for line in ("id=adb_enable", "name=ADB Enable", "version=v1.0.1", "versionCode=10001"):
     if line not in props.splitlines():
         problems.append("module.prop missing " + line)
 if b"\r\n" in z.read("module.prop"):
@@ -955,7 +1000,7 @@ test_negative_control() {
 cd "$ROOT" || exit 1
 for t in test_syntax test_no_binder_redirect test_post_fs_data test_service_svc \
 	test_service_prop_fallback test_settings_retry test_full_boot test_zero_config \
-	test_ffs_not_ready test_keys_unknown_types test_keys_oversized_symlink \
+	test_adbd_preexisting_refresh test_adbd_already_insecure test_ffs_not_ready test_keys_unknown_types test_keys_oversized_symlink \
 	test_keys_backup_and_chcon_failure test_wireless_off_clears_persist \
 	test_uninstall_clears_tcp test_wireless_off_master_off \
 	test_wireless_default_off_early test_usb_config_validation \

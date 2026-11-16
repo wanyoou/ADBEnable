@@ -1,6 +1,6 @@
 id=adb_enable
 name=ADB Enable
-version=v1.0.0
-versionCode=10000
+version=v1.0.1
+versionCode=10001
 author=ADBEnable
 description=坏屏/无触摸救机：刷入重启即开 USB 调试并免授权（无需公钥），修复 USB 枚举与 adbd，绕过 MIUI 安全限制，跳过开机向导。

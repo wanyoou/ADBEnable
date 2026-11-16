@@ -28,6 +28,11 @@ reset_paths() {
 	CONFIG_FILE="${ADBEN_CONFIG:-$STATE_DIR/config}"
 	LOG_DIR="$STATE_DIR/log"
 	LOG_FILE="${ADBEN_LOG:-$LOG_DIR/adb-enable.log}"
+	# Set by post-fs-data only if adbd was already running before
+	# ro.adb.secure=0 was applied.  The service stage must not restart a
+	# daemon that was started after the property was set: that would drop
+	# an already working USB session for no reason.
+	ADBD_PREEXISTING_FLAG="$STATE_DIR/.adbd_preexisting"
 	ADB_MISC_DIR="${ADBEN_ADB_MISC_DIR:-/data/misc/adb}"
 	ADB_KEYS_FILE="${ADBEN_ADB_KEYS:-$ADB_MISC_DIR/adb_keys}"
 	SYSTEM_BIN="${ADBEN_SYSTEM_BIN:-/system/bin}"
@@ -797,7 +802,13 @@ ensure_adbd() {
 		log "adbd: '$svc_state', starting"
 		run_quiet "$SETPROP_CMD" ctl.start adbd
 		sleep 2
-		log "adbd: now '$(prop_get init.svc.adbd)'"
+		svc_state=$(prop_get init.svc.adbd)
+		log "adbd: now '$svc_state'"
+		if [ "$svc_state" = running ]; then
+			# This start happened after ro.adb.secure=0, so adbd has
+			# already read the right value; do not restart it.
+			rm -f "$ADBD_PREEXISTING_FLAG" 2>/dev/null
+		fi
 	else
 		log "adbd: already running"
 	fi
@@ -807,15 +818,32 @@ ensure_adbd() {
 # adbd reads ro.adb.secure once at startup.  On an unlocked bootloader
 # (ro.boot.verifiedbootstate=orange) the value 0 disables authorization
 # completely, which is what makes a key-less "flash and reboot" work.
-# Restart adbd once per boot so a daemon that was started before our
-# post-fs-data props cannot keep requiring a key.
+#
+# Restart only when adbd was already running *before* post-fs-data set the
+# property.  In the normal boot order adbd starts afterwards and has already
+# read 0; restarting it then would disconnect a working adb/scrcpy session.
 refresh_adbd_auth() {
 	[ "$FORCE_INSECURE_ADB" = 1 ] || return 0
 	[ "$START_ADBD" = 1 ] || return 0
 	[ -n "$SETPROP_CMD" ] || return 0
 	[ "$(prop_get init.svc.adbd)" = running ] || return 0
-	log "adbd: restarting once to apply ro.adb.secure=0"
+
+	if [ "$(prop_get ro.adb.secure)" != 0 ]; then
+		log "adbd: ro.adb.secure='$(prop_get ro.adb.secure)', not restarting"
+		rm -f "$ADBD_PREEXISTING_FLAG" 2>/dev/null
+		return 0
+	fi
+	flag=$(cat "$ADBD_PREEXISTING_FLAG" 2>/dev/null)
+	if [ "$flag" != 1 ]; then
+		log "adbd: started after ro.adb.secure=0, no restart needed"
+		return 0
+	fi
+	log "adbd: restarting once (it was running before ro.adb.secure=0)"
 	run_quiet "$SETPROP_CMD" ctl.restart adbd
+	# Clear the flag even if the restart failed: a retry in the 90 s recheck
+	# would disconnect the session again.  ensure_adbd() will start adbd
+	# fresh (and it will read the current property) on the next pass.
+	rm -f "$ADBD_PREEXISTING_FLAG" 2>/dev/null
 	sleep 2
 	log "adbd: now '$(prop_get init.svc.adbd)'"
 	return 0
@@ -973,11 +1001,37 @@ main_post_fs_data() {
 	setup_runtime
 	rotate_log
 	log "===== ADB Enable $(module_version) post-fs-data ====="
+	# A flag from a previous boot must never trigger a restart in this boot.
+	rm -f "$ADBD_PREEXISTING_FLAG" 2>/dev/null
+	ro_secure_before=$(prop_get ro.adb.secure)
+	adbd_preexisting=0
+	# If the ROM already had ro.adb.secure=0, even a pre-existing adbd read
+	# 0 and does not need a restart.  Otherwise a running adbd may have read
+	# 1 before this script changed it.
+	[ "$(prop_get init.svc.adbd)" = running ] && [ "$ro_secure_before" != 0 ] && adbd_preexisting=1
 	# Keys first: nothing may start adbd before the trust store is in place.
 	sync_keys early
 	# Wireless ADB is off by default; remove any stale 5555 before adbd runs.
 	[ "$WIRELESS_ADB" = 1 ] || clear_tcp_ports
 	apply_props
+	# If adbd appeared while we were setting up, it may have read the old
+	# ro.adb.secure=1.  Record that so the service stage can refresh it
+	# once; otherwise it already read 0 and must not be restarted.
+	[ "$(prop_get init.svc.adbd)" = running ] && [ "$ro_secure_before" != 0 ] && adbd_preexisting=1
+	if [ "$adbd_preexisting" = 1 ]; then
+		if printf '1\n' >"$ADBD_PREEXISTING_FLAG" 2>/dev/null; then
+			log "adbd: running before ro.adb.secure=0, auth refresh scheduled"
+		else
+			log "adbd: cannot write $ADBD_PREEXISTING_FLAG, no restart will be attempted"
+		fi
+	else
+		printf '0\n' >"$ADBD_PREEXISTING_FLAG" 2>/dev/null
+		if [ "$(prop_get init.svc.adbd)" = running ]; then
+			log "adbd: already running with ro.adb.secure=0, no refresh needed"
+		else
+			log "adbd: not running yet, it will read ro.adb.secure=0 on start"
+		fi
+	fi
 	log "post-fs-data done"
 }
 

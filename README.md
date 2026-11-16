@@ -6,7 +6,7 @@
 
 - 模块 ID：`adb_enable`
 - 模块名：`ADB Enable`
-- 版本：`v1.0.0`（versionCode `10000`）
+- 版本：`v1.0.1`（versionCode `10001`）
 - 状态目录：`/data/adb/adb-enable/`
 - 日志：`/data/adb/adb-enable/log/adb-enable.log`
 
@@ -44,10 +44,10 @@
 
 ```powershell
 # 1) 把 zip 推到手机
-adb push .\ADB-Enable-v1.0.0.zip /sdcard/
+adb push .\ADB-Enable-v1.0.1.zip /sdcard/
 
 # 2) 在 TWRP 里安装（不需要触摸）
-adb shell "twrp install /sdcard/ADB-Enable-v1.0.0.zip"
+adb shell "twrp install /sdcard/ADB-Enable-v1.0.1.zip"
 
 # 3) 重启
 adb reboot
@@ -56,8 +56,8 @@ adb reboot
 ### 方式 2：ADB 已经可用
 
 ```powershell
-adb push .\ADB-Enable-v1.0.0.zip /sdcard/
-adb shell "su -c 'magisk --install-module /sdcard/ADB-Enable-v1.0.0.zip'"
+adb push .\ADB-Enable-v1.0.1.zip /sdcard/
+adb shell "su -c 'magisk --install-module /sdcard/ADB-Enable-v1.0.1.zip'"
 adb reboot
 ```
 
@@ -198,7 +198,12 @@ auth_required = GetBoolProperty("ro.adb.secure", false);
 ```
 
 值为 `0` 时 `auth_required=false`，整个授权握手被跳过——电脑上的 `~/.android/adbkey.pub`
-根本不需要出现在手机里。模块还会在开机后重启一次 `adbd`，确保它读到的是新值。
+根本不需要出现在手机里。
+
+`ro.adb.secure` 只在 `adbd` 启动时读取一次。正常情况下，模块在 `post-fs-data`
+阶段就把它设为 `0`，`adbd` 之后才启动，已经读到正确值，因此**不会再重启 `adbd`**，
+不会把已经连上的 `adb` / `scrcpy` 断开。只有检测到 `adbd` 在属性设置前就已经运行时，
+`service` 阶段才会补一次重启，让它重新读取。
 
 ### 6.3 公钥文件从哪来
 
@@ -422,7 +427,8 @@ late_start service（非阻塞）
   ├─ 【可选】再同步一次公钥（KEYS_FROM_STORAGE=1 时才读 /sdcard）
   ├─ svc usb setFunctions mtp,adb → 失败则 sys.usb.config none → mtp,adb → adb
   ├─ init.svc.adbd != running 时 setprop ctl.start adbd
-  ├─ 免授权模式下重启一次 adbd，确保它读到 ro.adb.secure=0
+  ├─ 仅当 adbd 早于 ro.adb.secure=0 启动时，重启一次让它重新读取
+  │    （正常启动顺序下 adbd 已读到 0，不重启，避免断开已连接会话）
   ├─ 可选：service.adb.tcp.port=5555 + ctl.restart adbd
   ├─ 可选：input keyevent 224 / wm dismiss-keyguard
   └─ 90 秒内每 15 秒检查 adb_enabled，被改回 0 就重来一遍
@@ -468,13 +474,17 @@ adb shell "su -c '/data/adb/modules/adb_enable/bin/adb-enable status'"
 ... [service] settings: global/adb_enabled=1 OK
 ... [service] usb: svc usb setFunctions mtp,adb worked
 ... [service] adbd: now 'running'
-... [service] adbd: restarting once to apply ro.adb.secure=0
+... [service] adbd: started after ro.adb.secure=0, no restart needed
 ... [service] status: adb_enabled=1 dev_options=1 provisioned=1 setup=1
 ... [service] status: adbd=running usb_config=mtp,adb usb_state=mtp,adb ffs=1
 ... [service] status: adb_secure=0 debuggable= miui_input=1 miui_install=1 keys=0 wireless=service:-1,persist:-1
 ```
 
 如果你用了公钥，前两行会变成 `keys: installed N key(s)` / `keys: unchanged`，其余一致。
+
+如果日志出现 `adbd: running before ro.adb.secure=0, auth refresh scheduled`，说明 ROM
+在模块设置属性前就启动了 `adbd`；此时 `service` 会补一次重启，日志里会看到
+`restarting once (it was running before ro.adb.secure=0)`。正常启动顺序下不会出现这两行。
 
 如果信任库被误改，可以用模块自动留下的备份恢复（TWRP 里，root）：
 
@@ -551,7 +561,7 @@ module/                     # 模块源码（zip 根目录内容）
 ├── keys/README.txt
 └── META-INF/com/google/android/{update-binary,updater-script}
 
-build.py                    # 打包：dist/ADB-Enable-v1.0.0.zip（含执行位）
+build.py                    # 打包：dist/ADB-Enable-v1.0.1.zip（含执行位）
 tests/run_tests.sh          # 主机侧测试：dash + BusyBox ash + 假 Android 环境
 ```
 
